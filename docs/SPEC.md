@@ -1,8 +1,8 @@
 # Community Bridge – Emergency Assistance Funding MCP Server
 
-## Specification v1.0 (initial, written before implementation)
+## Specification v1.1
 
-Status: v1.0 – committed before any implementation code. Later changes are logged in `docs/CHANGELOG-SPEC.md` with the reason.
+Status: v1.0 committed before any implementation code; v1.1 clarifies retry, list-filter, summary and text rules (see `docs/CHANGELOG-SPEC.md`). Later changes are logged in `docs/CHANGELOG-SPEC.md` with the reason.
 
 ---
 
@@ -57,7 +57,7 @@ Status: v1.0 – committed before any implementation code. Later changes are log
 - **REQ-2** Amount validation: decimal string, > 0, at most 2 decimal places, ≤ 100000.00. Stored as integer cents.
 - **REQ-3** New request status is `PENDING`. Creation does not change any fund balance.
 - **REQ-4** Requests are immutable after submission: no tool edits participant, fund, category, purpose or amount.
-- **REQ-5** Optional `client_request_id` for safe retries of create. Same caller + same key + same payload → return the original request (`replayed: true`), no new row. Same key + different payload → `CONFLICT`.
+- **REQ-5** Optional `client_request_id` for safe retries of create. Same caller + same key + same payload → return the original request (`replayed: true`), no new row. Same key + different payload → `CONFLICT`. "Same payload" compares the **normalized** values: `participant_id`, `fund_id`, `category`, trimmed `purpose`, and `amount_cents` (so `"300"` and `"300.00"` are the same).
 
 ### Workflow
 
@@ -71,8 +71,8 @@ Status: v1.0 – committed before any implementation code. Later changes are log
 ### Reporting
 
 - **RPT-1** Get one request by ID.
-- **RPT-2** List requests, optional filters `status`, `fund_id`, `participant_id`.
-- **RPT-3** Funding summary per fund: allocation, committed, paid, available, and request counts by status.
+- **RPT-2** List requests, optional filters `status`, `fund_id`, `participant_id`. An unknown `status` value → `VALIDATION_ERROR`. A `fund_id` / `participant_id` that does not exist in the caller's nonprofit simply matches nothing (empty list, not `NOT_FOUND`), so filters never reveal other nonprofits' IDs. Order: `created_at` descending, then `id` descending; max 200 rows.
+- **RPT-3** Funding summary per fund: allocation, committed, paid, available, and `counts_by_status` = `{"PENDING": n, "APPROVED": n, "REJECTED": n, "PAID": n}` (all four keys always present, integers). Unknown or cross-tenant `fund_id` → `NOT_FOUND`.
 
 ### Non-functional
 
@@ -119,14 +119,14 @@ Invariant (enforced by code **and** a DB `CHECK` constraint): `0 ≤ committed`,
 
 ### 3.3 Validation rules
 
-| Field               | Rule                                                               |
-| ------------------- | ------------------------------------------------------------------ |
-| `amount`            | string matching `^\d{1,6}(\.\d{1,2})?$`, value > 0 and ≤ 100000.00 |
-| `category`          | one of `RENT`, `UTILITIES`, `TRANSPORTATION`, `OTHER`              |
-| `purpose`           | 1–200 chars after trimming                                         |
-| `reason` (reject)   | optional, ≤ 500 chars                                              |
-| IDs                 | non-empty string ≤ 64 chars; must exist **in caller's nonprofit**  |
-| `client_request_id` | optional, 1–64 chars                                               |
+| Field               | Rule                                                                  |
+| ------------------- | --------------------------------------------------------------------- |
+| `amount`            | string matching `^\d{1,6}(\.\d{1,2})?$`, value > 0 and ≤ 100000.00    |
+| `category`          | one of `RENT`, `UTILITIES`, `TRANSPORTATION`, `OTHER`                 |
+| `purpose`           | trimmed, then 1–200 chars; the **trimmed** value is stored            |
+| `reason` (reject)   | optional; trimmed, ≤ 500 chars; empty after trimming → stored as null |
+| IDs                 | non-empty string ≤ 64 chars; must exist **in caller's nonprofit**     |
+| `client_request_id` | optional, 1–64 chars                                                  |
 
 Check order inside every tool: **role → input validation → tenant lookup → state/funds check → write**. Role is checked first so unauthorized callers learn nothing about records.
 
@@ -190,18 +190,18 @@ Error      = { "error": { "code": <ErrorCode>, "message": str, "details": {...} 
 
 ### 5.2 Tools
 
-| Tool                  | Roles           | Input                                                                    | Output                                                 | Side effects                                              |
-| --------------------- | --------------- | ------------------------------------------------------------------------ | ------------------------------------------------------ | --------------------------------------------------------- |
-| `whoami`              | all             | —                                                                        | `{staff_id, name, role, nonprofit_id, nonprofit_name}` | none                                                      |
-| `list_participants`   | all             | —                                                                        | `{participants: [{id, name}]}`                         | none                                                      |
-| `list_funds`          | all             | —                                                                        | `{funds: [FundStatus]}`                                | none                                                      |
-| `create_request`      | CASE_WORKER     | `participant_id, fund_id, category, purpose, amount, client_request_id?` | `{request: Request, replayed: bool}`                   | inserts request + audit (`CREATED`)                       |
-| `approve_request`     | PROGRAM_MANAGER | `request_id`                                                             | `{request: Request, fund: FundStatus}`                 | status → APPROVED, fund.committed += amount, audit        |
-| `reject_request`      | PROGRAM_MANAGER | `request_id, reason?`                                                    | `{request: Request}`                                   | status → REJECTED, audit                                  |
-| `record_payment`      | FINANCE         | `request_id`                                                             | `{request: Request, fund: FundStatus}`                 | status → PAID, committed −= amount, paid += amount, audit |
-| `get_request`         | all             | `request_id`                                                             | `{request: Request}`                                   | none                                                      |
-| `list_requests`       | all             | `status?, fund_id?, participant_id?`                                     | `{requests: [Request]}` (newest first, max 200)        | none                                                      |
-| `get_funding_summary` | all             | `fund_id?`                                                               | `{funds: [FundStatus + counts_by_status]}`             | none                                                      |
+| Tool                  | Roles           | Input                                                                    | Output                                                      | Side effects                                              |
+| --------------------- | --------------- | ------------------------------------------------------------------------ | ----------------------------------------------------------- | --------------------------------------------------------- |
+| `whoami`              | all             | —                                                                        | `{staff_id, name, role, nonprofit_id, nonprofit_name}`      | none                                                      |
+| `list_participants`   | all             | —                                                                        | `{participants: [{id, name}]}`                              | none                                                      |
+| `list_funds`          | all             | —                                                                        | `{funds: [FundStatus]}`                                     | none                                                      |
+| `create_request`      | CASE_WORKER     | `participant_id, fund_id, category, purpose, amount, client_request_id?` | `{request: Request, replayed: bool}`                        | inserts request + audit (`CREATED`)                       |
+| `approve_request`     | PROGRAM_MANAGER | `request_id`                                                             | `{request: Request, fund: FundStatus}`                      | status → APPROVED, fund.committed += amount, audit        |
+| `reject_request`      | PROGRAM_MANAGER | `request_id, reason?`                                                    | `{request: Request}`                                        | status → REJECTED, audit                                  |
+| `record_payment`      | FINANCE         | `request_id`                                                             | `{request: Request, fund: FundStatus}`                      | status → PAID, committed −= amount, paid += amount, audit |
+| `get_request`         | all             | `request_id`                                                             | `{request: Request}`                                        | none                                                      |
+| `list_requests`       | all             | `status?, fund_id?, participant_id?`                                     | `{requests: [Request]}` (rules in RPT-2)                    | none                                                      |
+| `get_funding_summary` | all             | `fund_id?`                                                               | `{funds: [FundStatus + counts_by_status]}` (shape in RPT-3) | none                                                      |
 
 ### 5.3 Errors
 
@@ -288,6 +288,8 @@ Seed: nonprofit **CB** (fund `fund-cb-rent` $10,000.00, fund `fund-cb-utility` $
 ---
 
 ## 9. Production security (HTTP-hosted MCP)
+
+_Design note only — not implemented in this exercise (OAuth and remote hosting are out of scope). The local build uses stdio + `CB_STAFF_ID` (§6); this section explains what replaces that step in production._
 
 - The MCP server runs over Streamable HTTP as an **OAuth 2.1 resource server**; the organization's existing authorization server (e.g. Entra ID / Okta / Auth0) issues tokens. The server publishes Protected Resource Metadata pointing clients to that authorization server.
 - Every HTTP request must carry `Authorization: Bearer <access token>`. The server validates: signature via the provider's JWKS (cached, key rotation), `iss`, `aud` = this MCP server (prevents token reuse from other apps), `exp`/`nbf`, and required scopes (e.g. `cb.read`, `cb.write`). Invalid → HTTP 401 with `WWW-Authenticate`; valid but insufficient → 403.
