@@ -32,3 +32,15 @@ Rejected: "HTTP/OAuth contradicts the stdio implementation". The brief asks only
   - Code review also found `format_cents` used `cents / 100` (float), violating NFR-1 — not caught by tests because output looked correct.
 - **Correction:** Copilot Agent mode, given the failing tests, rewrote the function (1–2 decimals, `<= 0` check, max check, `divmod` instead of float). Re-ran: **27 passed**. I re-read the final code to confirm no float remains.
 - **Lesson:** Tests caught 3 of 4 bugs; manual review caught the 4th.
+
+## Example 3 — Debugging / verification (MCP SDK version, task T6)
+
+- **Context:** `pip install "mcp[cli]"` installed **mcp 2.3.0**. Most tutorials and AI suggestions (including my assistant's first plan: "use FastMCP") target SDK v1 (`from mcp.server.fastmcp import FastMCP`, result fields `isError` / `structuredContent`).
+- **Prompt / approach (Claude):** instead of trusting remembered APIs, the assistant wrote `scratch/inspect_mcp.py` to print the installed package's real signatures (`MCPServer.__init__`, `MCPServer.tool`, `MCPServer.run`, `ClientSession`, `stdio_client`, `CallToolResult` fields).
+- **Evidence found:** v2 exposes `mcp.server.mcpserver.MCPServer` (the old `fastmcp` module still exists but the plan was updated to the v2 class); `CallToolResult` fields are snake_case — `is_error`, `structured_content`; `Tool` has `input_schema` / `output_schema`.
+- **Correction:** server written against `MCPServer`; client helper (`demo/mcp_helpers.py`) reads `result.is_error` / `result.structured_content`. Using v1 names would have silently returned `None`/`AttributeError` in the E2E test.
+- **Independent verification:** `pytest -q` → **106 passed** on my machine (Windows, Python 3.14.6), including `test_e2e_mcp.py`, which launches the real server over stdio; `python demo\demo_client.py` output matches the brief's $300 / $10,000 example (`docs/demo-output.txt`).
+
+## Concurrency verification note
+
+The approval code (single conditional `UPDATE` inside `BEGIN IMMEDIATE`) was checked by tests, not by trusting the design: `test_concurrency.py` releases threads with separate DB connections at the same instant via `threading.Barrier`; repeated 20× plus a 12-way and a same-request race. All passed.
